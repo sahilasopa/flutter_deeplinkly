@@ -67,13 +67,20 @@ class FlutterDeeplinklyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, 
             Log.d("Deeplinkly", "📨 handleIntent called with: $intent")
 
             val data: Uri? = intent?.data ?: return
-            Log.d("Deeplinkly", "Data: " + data.toString())
-            val clickId = data?.getQueryParameter("click_id") ?: return
+            Log.d("Deeplinkly", "Data: $data")
+
             val context = activity ?: return
             val appInfo = context.packageManager.getApplicationInfo(context.packageName, android.content.pm.PackageManager.GET_META_DATA)
             val apiKey = appInfo.metaData.getString("com.deeplinkly.sdk.api_key") ?: return
 
-            Log.d("Deeplinkly", "🆔 click_id = $clickId")
+            val clickId = data?.getQueryParameter("click_id")
+            val code = data?.pathSegments?.firstOrNull()
+
+
+            if (clickId == null && code == null) {
+                Log.d("Deeplinkly", "❌ No click_id or code found in intent URI")
+                return
+            }
 
             val enrichmentData = try {
                 collectEnrichmentData(context)
@@ -82,18 +89,24 @@ class FlutterDeeplinklyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, 
                 emptyMap<String, String?>()
             }.toMutableMap()
 
-            enrichmentData["click_id"] = clickId
+            if (clickId != null) enrichmentData["click_id"] = clickId
+            if (clickId == null && code != null) enrichmentData["code"] = code
             enrichmentData["android_reported_at"] = try {
-                java.time.Instant.now().toString()
+                Instant.now().toString()
             } catch (_: Exception) {
                 System.currentTimeMillis().toString()
             }
 
-            // resolve + then enrich in background
+            val finalUrl = if (clickId != null) {
+                "https://sahilasopa.pagekite.me/api/v1/resolve-click?click_id=$clickId"
+            } else {
+                "https://sahilasopa.pagekite.me/api/v1/resolve-click?code=$code"
+            }
+
+            // 🔄 Async request to resolve-click + enrichment
             Thread {
                 try {
-                    val url = "https://sahilasopa.pagekite.me/api/v1/resolve?click_id=$clickId"
-                    val conn = URL(url).openConnection() as HttpURLConnection
+                    val conn = URL(finalUrl).openConnection() as HttpURLConnection
                     conn.setRequestProperty("Authorization", "Bearer $apiKey")
                     conn.setRequestProperty("Accept", "application/json")
 
@@ -104,9 +117,11 @@ class FlutterDeeplinklyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, 
                         val params = json.optJSONObject("params") ?: JSONObject()
 
                         val dartMap = HashMap<String, Any?>()
-                        dartMap["click_id"] = clickId
-                        params.keys().forEach { key ->
-                            dartMap[key] = params.get(key)
+                        dartMap["click_id"] = clickId ?: json.optString("click_id", null)
+                        params.keys().forEach { key -> dartMap[key] = params.get(key) }
+                        val resolvedClickId = clickId ?: json.optString("click_id", null)
+                        if (!resolvedClickId.isNullOrBlank()) {
+                            enrichmentData["click_id"] = resolvedClickId
                         }
 
                         activity?.runOnUiThread {
@@ -116,7 +131,7 @@ class FlutterDeeplinklyPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, 
                         sendEnrichment(enrichmentData, apiKey)
 
                     } else {
-                        reportError(apiKey, "resolve failed with code $responseCode", "resolve: $url", clickId)
+                        reportError(apiKey, "resolve failed with code $responseCode", "resolve: $finalUrl", clickId)
                     }
                 } catch (e: Exception) {
                     reportError(apiKey, "resolve exception", e.stackTraceToString(), clickId)
